@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A real-world ROS 2 mobile-robot project that combines **RGB semantics**, **Livox MID360 geometry**, **persistent spatial memory**, and eventually **language-guided navigation / VLN**.
+A real-world ROS 2 mobile-robot project that combines **RGB semantics**, **Livox MID360 geometry**, optional **RGB-D depth as an auxiliary signal**, **persistent spatial memory**, and eventually **language-guided navigation / VLN**.
 
 > **Project status:** initialization and platform onboarding.  
 > The roadmap below defines the intended system. Features are only considered implemented after they are integrated and validated on the real robot.
@@ -54,11 +54,13 @@ This repository does **not** duplicate those components.
 ┌─────────────────────────────────────────────────────┐
 │ real-world-rgb-lidar-navigation                     │
 │                                                     │
-│  RGB Camera                                         │
-│      ↓                                              │
-│  Visual / Open-Vocabulary Perception                │
-│      ↓                                              │
+│  RGB-D Camera                                       │
+│   ├─ RGB ──> Visual / Open-Vocabulary Perception    │
+│   └─ Depth ─> Auxiliary baseline / validation       │
+│                         │                           │
 │  RGB-LiDAR 3D Grounding  ←  MID360 point cloud      │
+│                         │                           │
+│        (MID360 = primary geometry source)            │
 │      ↓                                              │
 │  3D Object Localization                             │
 │      ↓                                              │
@@ -88,15 +90,15 @@ This repository does **not** duplicate those components.
 The intended software boundary is simple:
 
 - **Existing platform:** make the robot localize, plan, avoid obstacles, and physically reach a metric goal.
-- **This repository:** decide *what* the robot should navigate to from RGB, LiDAR geometry, spatial memory, and language.
+- **This repository:** decide *what* the robot should navigate to from RGB, LiDAR geometry, optional camera depth, spatial memory, and language.
 
 ## Roadmap
 
 | Milestone | Engineering goal | Demonstrable result |
 |---|---|---|
 | **M0 — Platform Onboarding** | Run and understand the existing real-robot stack end to end | Click a goal in RViz and have the robot navigate to it autonomously |
-| **M1 — RGB Integration** | Add front RGB camera, intrinsics, timestamps, TF, and camera-LiDAR extrinsics | Live RGB stream aligned with MID360 geometry |
-| **M2 — RGB-LiDAR 3D Grounding** | Detect an object in RGB and associate LiDAR points with it | See a chair and estimate its 3D / map-frame position |
+| **M1 — RGB / RGB-D Camera Integration** | Integrate the available RGB-D camera: RGB stream, optional depth stream, intrinsics, timestamps, TF, and camera-LiDAR extrinsics | Live RGB aligned with MID360 geometry, with aligned camera depth available for debugging / baselines |
+| **M2 — RGB-LiDAR 3D Grounding** | Use RGB semantics + MID360 geometry as the primary grounding path; compare against RGB-D and optional RGB-D+LiDAR variants | See a chair and estimate its 3D / map-frame position, with sensor-source ablations available |
 | **M3 — Semantic Navigation** | Convert a semantic target into a safe Nav2 approach pose | `go to the chair` causes the real robot to navigate to the chair |
 | **M4 — Persistent Spatial Memory** | Fuse repeated observations into a persistent object-level map | The robot can navigate back to an object that is no longer visible |
 | **M5 — Language-Guided Navigation / VLN** | Use language reasoning plus memory to select sequential semantic waypoints | Follow instructions such as “exit the room, pass the sofa, turn left, and stop near the printer” |
@@ -112,25 +114,36 @@ This prevents the project from turning into another simulation-only VLN stack be
 
 ## Planned Technical Direction
 
-### M1 — RGB integration
+### M1 — RGB / RGB-D camera integration
+
+The available lab RGB-D camera is preferred over buying or adding a separate RGB-only camera. However, **camera depth is not a hard dependency of the project**.
+
+Sensor roles are intentionally separated:
+
+- **RGB:** primary semantic / visual input.
+- **Livox MID360:** primary geometry source for grounding, mapping, and navigation.
+- **RGB-D depth:** auxiliary signal for debugging, fast baselines, cross-checking, and later ablation / fusion experiments.
 
 Expected interfaces:
 
 ```text
-RGB camera
-   ↓
-ROS 2 image + camera_info
-   ↓
-camera intrinsics
-   ↓
-camera ↔ LiDAR extrinsic calibration
-   ↓
-tf2 alignment with base_link / map
+RGB-D camera
+   ├─> RGB image + camera_info ──> required semantic input
+   └─> aligned depth image ──────> optional auxiliary input
+                    │
+                    ↓
+          camera intrinsics
+                    ↓
+       camera ↔ LiDAR extrinsic calibration
+                    ↓
+       tf2 alignment with base_link / map
 ```
+
+M1 is complete when the RGB stream is temporally and spatially usable together with MID360. If the camera provides depth, that depth stream should also be exposed and sanity-checked, but semantic navigation must not depend on it.
 
 ### M2 — RGB-LiDAR 3D grounding
 
-Initial design:
+The **primary research / system path** remains RGB + MID360:
 
 ```text
 RGB image ──> object / open-vocabulary detector ──> 2D box or mask
@@ -143,6 +156,24 @@ MID360 point cloud ──> projection into camera ─────────┘
                                                        ↓
                                                 map-frame object
 ```
+
+The RGB-D camera also enables two useful comparison paths:
+
+```text
+A. RGB-D baseline
+   RGB detection + aligned camera depth
+        └─> object 3D position
+
+B. RGB + MID360                 [primary]
+   RGB detection + LiDAR projection
+        └─> object 3D position
+
+C. RGB-D + MID360               [optional]
+   camera depth + LiDAR geometry
+        └─> cross-check / fusion
+```
+
+This makes it possible to compare localization error, robustness, range, latency, and navigation success without changing the core project goal. A useful later research question is whether a dedicated depth stream remains necessary when the mobile robot already carries a 3D LiDAR.
 
 The detector is intentionally **not fixed yet**. Candidates can be compared later based on real-time performance, open-vocabulary capability, and Jetson deployment cost.
 
@@ -209,6 +240,7 @@ Current architectural references include hierarchical memory/reasoning approache
 4. **Measure before optimizing.** Each milestone should have repeatable real-world tests, logs, and failure cases.
 5. **Do not lock models prematurely.** The project goal stays fixed even if the detector, VLM, memory representation, or deployment backend changes.
 6. **Keep research and engineering connected.** New VLN or spatial-intelligence methods should enter the system only when they solve a demonstrated failure or enable a measurable capability.
+7. **Use depth as an option, not a crutch.** RGB-D depth may accelerate baselines and debugging, but the main semantic grounding path must remain valid with RGB + MID360 alone.
 
 ## Initial Non-Goals
 
@@ -218,6 +250,7 @@ The following are intentionally out of scope for the early milestones:
 - rebuilding Nav2 or the existing robot chassis stack
 - training a large VLM from scratch
 - making 3D Gaussian Splatting a requirement before a concrete need is demonstrated
+- making RGB-D camera depth mandatory for semantic navigation
 - starting full VLN research before M3 semantic navigation is stable
 - claiming end-to-end autonomy before real-robot validation exists
 
