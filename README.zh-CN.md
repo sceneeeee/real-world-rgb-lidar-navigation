@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个面向真实移动机器人的 ROS 2 项目，目标是把 **RGB 语义感知、Livox MID360 几何信息、持续空间记忆** 和最终的 **语言引导导航 / VLN** 接到同一套真实机器人系统中。
+一个面向真实移动机器人的 ROS 2 项目，目标是把 **RGB 语义感知、Livox MID360 主几何信息、可选的 RGB-D 深度辅助信号、持续空间记忆** 和最终的 **语言引导导航 / VLN** 接到同一套真实机器人系统中。
 
 > **当前状态：项目初始化与平台熟悉阶段。**  
 > 下方 Roadmap 描述的是目标系统；只有在真实机器人上完成集成和验证后，某项能力才算真正实现。
@@ -54,11 +54,13 @@
 ┌─────────────────────────────────────────────────────┐
 │ real-world-rgb-lidar-navigation                     │
 │                                                     │
-│  RGB Camera                                         │
-│      ↓                                              │
-│  Visual / Open-Vocabulary Perception                │
-│      ↓                                              │
+│  RGB-D Camera                                       │
+│   ├─ RGB ──> Visual / Open-Vocabulary Perception    │
+│   └─ Depth ─> Auxiliary baseline / validation       │
+│                         │                           │
 │  RGB-LiDAR 3D Grounding  ←  MID360 point cloud      │
+│                         │                           │
+│        (MID360 = primary geometry source)            │
 │      ↓                                              │
 │  3D Object Localization                             │
 │      ↓                                              │
@@ -88,15 +90,15 @@
 职责边界：
 
 - **原平台：** 负责让机器人定位、规划、避障并真实到达一个 metric goal。
-- **本仓库：** 根据 RGB、LiDAR 几何、空间记忆和语言决定“机器人应该去哪里”。
+- **本仓库：** 根据 RGB、LiDAR 主几何、可选 camera depth、空间记忆和语言决定“机器人应该去哪里”。
 
 ## Roadmap
 
 | Milestone | 工程目标 | 做完以后机器人能做什么 |
 |---|---|---|
 | **M0 — Platform Onboarding** | 跑通并理解现有实机栈 | RViz 点目标，机器人自主导航过去 |
-| **M1 — RGB Integration** | 加入前向 RGB Camera、内参、时间戳、TF 和 Camera-LiDAR 外参 | 获得与 MID360 几何对齐的实时 RGB |
-| **M2 — RGB-LiDAR 3D Grounding** | RGB 检测目标并与 LiDAR 点关联 | 看到 chair 后得到其真实 3D / map 坐标 |
+| **M1 — RGB / RGB-D Camera Integration** | 接入实验室现有 RGB-D Camera：RGB、可选 depth、内参、时间戳、TF 和 Camera-LiDAR 外参 | 获得与 MID360 对齐的实时 RGB，并保留对齐 depth 用于调试 / baseline |
+| **M2 — RGB-LiDAR 3D Grounding** | 主线使用 RGB 语义 + MID360 几何，并与 RGB-D、可选 RGB-D+LiDAR 方案对比 | 看到 chair 后得到真实 3D / map 坐标，同时具备传感器消融对比 |
 | **M3 — Semantic Navigation** | 把语义目标转换为安全 Nav2 approach pose | 输入 `go to the chair`，机器人真实走到椅子附近 |
 | **M4 — Persistent Spatial Memory** | 将多次观测融合为持续的 object-level map | 即使目标已经不在视野里，也能回到之前看到的位置 |
 | **M5 — Language-Guided Navigation / VLN** | 用语言推理 + 空间记忆选择连续语义 waypoint | 执行“出门、经过沙发、左转、停在打印机旁”一类指令 |
@@ -116,21 +118,34 @@
 
 ## 各阶段具体做什么
 
-### M1 — RGB Integration
+### M1 — RGB / RGB-D Camera Integration
+
+实验室已有 RGB-D Camera，因此硬件上优先直接使用 RGB-D，而不是额外购买或安装 RGB-only Camera。但要明确：**camera depth 不是本项目的硬依赖。**
+
+传感器职责固定为：
+
+- **RGB：** 主要语义 / 视觉输入。
+- **Livox MID360：** 3D grounding、mapping 和 navigation 的主要几何来源。
+- **RGB-D Depth：** 调试、快速 baseline、交叉验证以及后续消融 / 融合实验的辅助信号。
 
 ```text
-RGB camera
-   ↓
-ROS 2 image + camera_info
-   ↓
-camera intrinsics
-   ↓
-camera ↔ LiDAR extrinsic calibration
-   ↓
-tf2 对齐到 base_link / map
+RGB-D camera
+   ├─> RGB image + camera_info ──> 必需的语义输入
+   └─> aligned depth image ──────> 可选辅助输入
+                    │
+                    ↓
+             camera intrinsics
+                    ↓
+       camera ↔ LiDAR extrinsic calibration
+                    ↓
+          tf2 对齐到 base_link / map
 ```
 
+M1 的核心验收仍然是 RGB 与 MID360 在时间和空间上能够共同使用。如果相机提供 depth，则同时发布并完成基本 sanity check，但后续 semantic navigation 不能依赖 camera depth 才能运行。
+
 ### M2 — RGB-LiDAR 3D Grounding
+
+**项目主线仍然是 RGB + MID360：**
 
 ```text
 RGB image ──> object / open-vocabulary detector ──> 2D box or mask
@@ -143,6 +158,24 @@ MID360 point cloud ──> 投影到 camera ────────────
                                                        ↓
                                              map-frame object
 ```
+
+RGB-D Camera 同时提供两个有价值的对照路径：
+
+```text
+A. RGB-D baseline
+   RGB detection + aligned camera depth
+        └─> object 3D position
+
+B. RGB + MID360                 [主线]
+   RGB detection + LiDAR projection
+        └─> object 3D position
+
+C. RGB-D + MID360               [可选]
+   camera depth + LiDAR geometry
+        └─> cross-check / fusion
+```
+
+后续可以比较 3D localization error、robustness、effective range、latency 和 semantic navigation success rate，而不改变项目主目标。一个自然的研究问题是：**当移动机器人已经搭载 3D LiDAR 时，额外的 dedicated depth stream 是否仍然必要？**
 
 目标检测模型目前**不锁死**。后续根据真实机器人上的实时性、开放词汇能力以及 Jetson 部署成本比较后再确定。
 
@@ -209,6 +242,7 @@ Nav2 execution
 4. **先测量，再优化。** 每个 milestone 都需要可重复的实机测试、日志和 failure cases。
 5. **路线锁死，模型不锁死。** detector、VLM 或 memory representation 可以变化，但项目目标不随论文变化。
 6. **Research 服务于工程问题。** 新 VLN / spatial intelligence 方法只有在解决真实 failure 或带来可测能力时才进入主线。
+7. **Depth 是选项，不是拐杖。** RGB-D depth 可以加速 baseline 和调试，但 RGB + MID360 必须能够独立完成主要 semantic grounding。
 
 ## 初期明确不做
 
@@ -216,6 +250,7 @@ Nav2 execution
 - 重建 Nav2 或底盘控制栈
 - 从头训练大型 VLM
 - 在没有明确需求前把 3D Gaussian Splatting 设成项目必选项
+- 把 RGB-D camera depth 设成 semantic navigation 的强制依赖
 - 在 M3 尚未稳定前把完整 VLN research 作为主开发任务
 - 在没有实机验证前声称系统已经实现 end-to-end autonomy
 
