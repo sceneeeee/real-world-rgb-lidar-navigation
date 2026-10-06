@@ -2,263 +2,557 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个面向真实移动机器人的 ROS 2 项目，目标是把 **RGB 语义感知、Livox MID360 主几何信息、可选的 RGB-D 深度辅助信号、持续空间记忆** 和最终的 **语言引导导航 / VLN** 接到同一套真实机器人系统中。
+一个面向真实移动机器人的 ROS 2 项目：在现有 **MID360 + Nav2** 平台之上，逐步加入 **开放词汇视觉感知、RGB-LiDAR 3D Grounding、语义导航、持续物体记忆**，最终扩展到 **VLN / 语言引导导航**。
 
-> **当前状态：项目初始化与平台熟悉阶段。**  
-> 下方 Roadmap 描述的是目标系统；只有在真实机器人上完成集成和验证后，某项能力才算真正实现。
+> **当前状态：proposal / platform onboarding。**  
+> 只有在真实机器人上完成集成和验证后，某项能力才算真正实现。
 
-## 为什么做这个项目
+## 项目目标
 
-这个项目延续此前在 VLN、Habitat 仿真和 LiDAR-aware navigation 上的工作，但重点开始从“仿真中的导航算法”转向“真实机器人上的完整 Robotics Software”。
+现有机器人已经能够定位、规划、避障并到达一个 metric pose。本项目增加的是它目前缺少的语义层：
 
-目标不是重做 SLAM 或 Nav2，而是在已有真实机器人自主导航平台上增加缺失的语义和语言层：
+~~~text
+metric goal
+    ↓
+visible object goal
+    ↓
+remembered object goal
+    ↓
+language-guided navigation
+~~~
 
-```text
-让机器人看见物体
-      ↓
-知道物体在真实空间哪里
-      ↓
-能够导航到语义目标
-      ↓
-能够记住曾经看过的环境
-      ↓
-最终执行更长的自然语言导航指令
-```
+整个系统采用分层结构。VLN 不负责替代 SLAM、Nav2 或底层控制，而是在真实感知和语义导航稳定之后，作为高层决策模块加入。
 
-因此，**VLN 并没有被放弃**。它被移动到了更合理的高层：建立在稳定的真实感知、定位和导航之上。
+## 已冻结的硬件与传感器方案
+
+初期硬件路线固定为：
+
+~~~text
+Jetson Orin NX
+├── Intel RealSense D435
+│   ├── RGB    → 主要语义 / 视觉输入
+│   └── Depth  → baseline、验证、消融、可选融合
+│
+└── Livox MID360
+    └── 3D geometry → 3D grounding 与 navigation 的主要几何来源
+~~~
+
+除非后续实测证明存在明确硬件问题，否则不再额外挂 RGB-only Camera；**D435 的 RGB 就作为项目的 RGB Camera。**
+
+### 主线和 Depth baseline 的区分
+
+项目的**主 semantic-grounding 路线**固定为：
+
+~~~text
+D435 RGB + MID360
+~~~
+
+D435 depth 会保持可用并记录，但主 semantic-navigation pipeline 必须能够在 camera depth 关闭时正常工作。
+
+计划比较三种 grounding 方案：
+
+| Variant | Semantic 3D grounding 使用的几何 | 角色 |
+|---|---|---|
+| **A — RGB-D** | D435 aligned depth | baseline |
+| **B — RGB + MID360** | 投影到 RGB 图像中的 MID360 点云 | **主方案** |
+| **C — RGB-D + MID360** | camera depth + LiDAR geometry | 可选融合 / upper-bound comparison |
+
+注意：三组实验中 MID360 仍然参与现有 FAST-LIO2 / Nav2 平台。这里比较的是**把语义观测提升到 3D 时使用哪一种几何来源**，不是把机器人底层定位切换成 RGB-D。
+
+因此项目形成一个明确问题：
+
+> **当移动机器人已经搭载 3D LiDAR 时，额外的 RGB-D depth 对真实 semantic grounding 和 semantic navigation 到底能带来多少收益？**
 
 ## 与现有机器人仓库的边界
 
-目标机器人平台由以下仓库维护：
+机器人底层平台由以下仓库维护：
 
 **[sceneeeee/XJTLU-autonomous-vehicle-rtk](https://github.com/sceneeeee/XJTLU-autonomous-vehicle-rtk)**
 
-该仓库已经提供本项目依赖的底层自主导航能力，包括：
+现有平台已经提供：
 
 - NVIDIA Jetson Orin NX、Ubuntu 22.04、ROS 2 Humble
-- Livox MID360 LiDAR 与 IMU 支持
+- Livox MID360 + IMU
 - FAST-LIO2 局部里程计
 - PGO 全局修正
-- `map -> odom -> base_link` TF 链
-- 点云到导航 costmap 的转换
-- Nav2 + MPPI 导航与控制
-- STM32 下位机串口控制
-- 已有真实机器人室内导航与避障流程
-- runtime logging 与 rosbag 调试链
+- map → odom → base_link TF
+- Nav2 + MPPI
+- STM32 / chassis interface
+- 室内实机导航
+- runtime logging 与 rosbag 调试
 
-**本仓库不重复实现以上功能。**
+**本仓库不重复实现这些底层组件。**
 
-## 系统架构
+## 目标系统架构
 
-```text
-┌─────────────────────────────────────────────────────┐
-│ real-world-rgb-lidar-navigation                     │
-│                                                     │
-│  RGB-D Camera                                       │
-│   ├─ RGB ──> Visual / Open-Vocabulary Perception    │
-│   └─ Depth ─> Auxiliary baseline / validation       │
-│                         │                           │
-│  RGB-LiDAR 3D Grounding  ←  MID360 point cloud      │
-│                         │                           │
-│        (MID360 = primary geometry source)            │
-│      ↓                                              │
-│  3D Object Localization                             │
-│      ↓                                              │
-│  Persistent Semantic / Spatial Memory               │
-│      ↓                                              │
-│  Language Reasoning / VLN                           │
-│      ↓                                              │
-│  Semantic Goal / Waypoint Generation                │
-└──────────────────────────┬──────────────────────────┘
-                           │ Nav2 goal / waypoint
-                           ▼
-┌─────────────────────────────────────────────────────┐
-│ XJTLU-autonomous-vehicle-rtk                        │
-│                                                     │
-│  MID360 + IMU                                       │
-│      ↓                                              │
-│  FAST-LIO2 + PGO                                    │
-│      ↓                                              │
-│  Nav2 + MPPI                                        │
-│      ↓                                              │
-│  STM32 + chassis                                    │
-│      ↓                                              │
-│  Real Robot                                         │
-└─────────────────────────────────────────────────────┘
-```
+~~~text
+                     Intel RealSense D435
+                    ┌──────────┴──────────┐
+                    │                     │
+                   RGB                  Depth
+                    │                     │
+                    │                 baseline /
+                    │                 ablation
+                    ↓                     │
+           NanoOWL open-vocabulary        │
+                detection                 │
+                    ↓                     │
+               NanoSAM mask               │
+                    ↓                     │
+              semantic mask               │
+                    │                     │
+                    ├──────────────┐      │
+                    │              │      │
+                    │         Livox MID360│
+                    │              │      │
+                    └──────┬───────┘      │
+                           ↓              │
+                  RGB-LiDAR 3D grounding ←┘ optional
+                           ↓
+                  map-frame object pose
+                           ↓
+                  semantic goal generation
+                           ↓
+                     Nav2 NavigateToPose
+                           ↓
+                        real robot
 
-职责边界：
+后续：
+map-frame observations
+        ↓
+persistent object memory
+        ↓
+language / VLN reasoning
+        ↓
+semantic waypoint(s)
+        ↓
+Nav2
+~~~
 
-- **原平台：** 负责让机器人定位、规划、避障并真实到达一个 metric goal。
-- **本仓库：** 根据 RGB、LiDAR 主几何、可选 camera depth、空间记忆和语言决定“机器人应该去哪里”。
+## Reference-Driven Roadmap
 
-## Roadmap
+每个 milestone 都绑定一个明确的工程目标和初始 reference。这里的 reference 表示“从什么方案开始复现 / 借鉴”，**不代表这些代码目前已经集成完成**。
 
-| Milestone | 工程目标 | 做完以后机器人能做什么 |
-|---|---|---|
-| **M0 — Platform Onboarding** | 跑通并理解现有实机栈 | RViz 点目标，机器人自主导航过去 |
-| **M1 — RGB / RGB-D Camera Integration** | 接入实验室现有 RGB-D Camera：RGB、可选 depth、内参、时间戳、TF 和 Camera-LiDAR 外参 | 获得与 MID360 对齐的实时 RGB，并保留对齐 depth 用于调试 / baseline |
-| **M2 — RGB-LiDAR 3D Grounding** | 主线使用 RGB 语义 + MID360 几何，并与 RGB-D、可选 RGB-D+LiDAR 方案对比 | 看到 chair 后得到真实 3D / map 坐标，同时具备传感器消融对比 |
-| **M3 — Semantic Navigation** | 把语义目标转换为安全 Nav2 approach pose | 输入 `go to the chair`，机器人真实走到椅子附近 |
-| **M4 — Persistent Spatial Memory** | 将多次观测融合为持续的 object-level map | 即使目标已经不在视野里，也能回到之前看到的位置 |
-| **M5 — Language-Guided Navigation / VLN** | 用语言推理 + 空间记忆选择连续语义 waypoint | 执行“出门、经过沙发、左转、停在打印机旁”一类指令 |
-| **M6 — Deployment & Simulation Extension** | 选择性做 Jetson 优化与必要的仿真 | TensorRT / profiling，以及有明确价值时的 Isaac Sim 对应系统 |
+| Milestone | 目标 | 主要 reference / repo | 实机结果 |
+|---|---|---|---|
+| **M0 — Platform Onboarding** | 验证已有 metric-navigation stack | 现有 robot repo、[Livox ROS Driver 2](https://github.com/Livox-SDK/livox_ros_driver2)、[FAST_LIO](https://github.com/hku-mars/FAST_LIO)、[Navigation2](https://github.com/ros-navigation/navigation2) | RViz 点目标 → 实机自主导航 |
+| **M1 — D435 + MID360 Integration** | 接入 D435，并完成 camera ↔ LiDAR 标定 | [realsense-ros](https://github.com/realsenseai/realsense-ros)、[FAST-Calib](https://github.com/hku-mars/FAST-Calib)、ROS 2 tf2 | RGB/depth 稳定输出，MID360 正确投影到 RGB |
+| **M2 — RGB-LiDAR 3D Grounding** | 检测物体并得到 map-frame 3D 坐标 | [NanoOWL](https://github.com/NVIDIA-AI-IOT/nanoowl)、[NanoSAM](https://github.com/NVIDIA-AI-IOT/nanosam)、ConceptFusion-style 2D→3D semantic lifting | 看到 chair → 得到真实 3D / map 坐标 |
+| **M3 — Semantic Navigation** | 把语义目标转换为安全 Nav2 approach pose | [VLMaps](https://github.com/vlmaps/vlmaps) 作为 semantic-navigation reference、[Navigation2](https://github.com/ros-navigation/navigation2) 执行 | go to the chair → 实机走到 chair 附近 |
+| **M4 — Persistent Spatial Memory** | 跨时间维护 object-level memory | [ConceptGraphs](https://github.com/concept-graphs/concept-graphs) 作为 object-memory / scene-graph reference | 目标离开视野后仍能回到其位置 |
+| **M5 — VLN** | 在 persistent semantic map 上加入语言推理 | **进入 M5 前选定并冻结一篇具体 VLN paper + repo** | 执行多步语言导航 |
+| **M6 — Deployment / Simulation Extension** | Jetson 优化；只有有必要时才增加仿真 | TensorRT / Jetson profiling；必要时 Isaac Sim | deployment benchmark / reproducible extension |
 
-### 当前执行规则
+### 执行顺序
 
-项目固定按照：
+~~~text
+M0 → M1 → M2 → M3 → M4 → M5
+~~~
 
-**M0 → M1 → M2 → M3**
+M0–M3 没有在真实机器人上稳定之前，不把 long-horizon VLN 作为主要开发任务。
 
-先在真实机器人上跑通。
+---
 
-在 M3 稳定之前，M4/M5 不作为主要开发重点。
+## M0 — 验证已有实机 Baseline
 
-这样可以避免项目再次变成“仿真里有 VLN、真实机器人却没有可靠 perception/navigation interface”的状态。
+### 目标
 
-## 各阶段具体做什么
+M0 不开发新的 perception algorithm，只确认已有 robot platform 能可靠作为后续依赖。
 
-### M1 — RGB / RGB-D Camera Integration
+~~~text
+MID360 + IMU
+      ↓
+FAST-LIO2
+      ↓
+PGO
+      ↓
+map → odom → base_link
+      ↓
+Nav2 + MPPI
+      ↓
+NavigateToPose
+      ↓
+real robot
+~~~
 
-实验室已有 RGB-D Camera，因此硬件上优先直接使用 RGB-D，而不是额外购买或安装 RGB-only Camera。但要明确：**camera depth 不是本项目的硬依赖。**
+### Reference
 
-传感器职责固定为：
+- **Robot source of truth：** [sceneeeee/XJTLU-autonomous-vehicle-rtk](https://github.com/sceneeeee/XJTLU-autonomous-vehicle-rtk)
+- **MID360 ROS：** [Livox-SDK/livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2)
+- **LiDAR-Inertial Odometry：** [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO)
+- **Navigation：** [ros-navigation/navigation2](https://github.com/ros-navigation/navigation2)
+- **PGO：** 直接复用现有 robot repo 已集成的实现；M0 不替换它。
 
-- **RGB：** 主要语义 / 视觉输入。
-- **Livox MID360：** 3D grounding、mapping 和 navigation 的主要几何来源。
-- **RGB-D Depth：** 调试、快速 baseline、交叉验证以及后续消融 / 融合实验的辅助信号。
+### M0 验收
 
-```text
-RGB-D camera
-   ├─> RGB image + camera_info ──> 必需的语义输入
-   └─> aligned depth image ──────> 可选辅助输入
-                    │
-                    ↓
-             camera intrinsics
-                    ↓
-       camera ↔ LiDAR extrinsic calibration
-                    ↓
-          tf2 对齐到 base_link / map
-```
+~~~text
+[ ] /livox/lidar 稳定
+[ ] FAST-LIO2 registered cloud / odometry 正常
+[ ] PGO / global correction 正常
+[ ] map → odom → base_link 正常
+[ ] NavigateToPose action 在线
+[ ] RViz fixed frame = map
+[ ] 完成一次短距离实机 click-to-go
+[ ] 保存本次运行日志
+~~~
 
-M1 的核心验收仍然是 RGB 与 MID360 在时间和空间上能够共同使用。如果相机提供 depth，则同时发布并完成基本 sanity check，但后续 semantic navigation 不能依赖 camera depth 才能运行。
+---
 
-### M2 — RGB-LiDAR 3D Grounding
+## M1 — D435 + MID360 接入与标定
 
-**项目主线仍然是 RGB + MID360：**
+### 1. D435 Bringup
 
-```text
-RGB image ──> object / open-vocabulary detector ──> 2D box or mask
-                                                       │
-MID360 point cloud ──> 投影到 camera ───────────────────┘
-                                                       ↓
-                                              关联目标点云
-                                                       ↓
-                                               滤波 / 聚类
-                                                       ↓
-                                             map-frame object
-```
+实验室相机固定为 **Intel RealSense D435**。
 
-RGB-D Camera 同时提供两个有价值的对照路径：
+初始 implementation reference：
 
-```text
-A. RGB-D baseline
-   RGB detection + aligned camera depth
-        └─> object 3D position
+- [realsenseai/realsense-ros](https://github.com/realsenseai/realsense-ros)
 
-B. RGB + MID360                 [主线]
-   RGB detection + LiDAR projection
-        └─> object 3D position
+需要获得：
 
-C. RGB-D + MID360               [可选]
-   camera depth + LiDAR geometry
-        └─> cross-check / fusion
-```
+~~~text
+D435
+├── RGB image
+├── RGB camera_info
+├── depth image
+├── aligned depth
+└── camera TF frames
+~~~
 
-后续可以比较 3D localization error、robustness、effective range、latency 和 semantic navigation success rate，而不改变项目主目标。一个自然的研究问题是：**当移动机器人已经搭载 3D LiDAR 时，额外的 dedicated depth stream 是否仍然必要？**
+RGB 是主线必须输入；depth 始终保留用于 baseline / validation。
 
-目标检测模型目前**不锁死**。后续根据真实机器人上的实时性、开放词汇能力以及 Jetson 部署成本比较后再确定。
+### 2. Camera ↔ LiDAR 外参
 
-### M3 — Semantic Navigation
+初始 calibration reference：
 
-```text
+- [hku-mars/FAST-Calib](https://github.com/hku-mars/FAST-Calib)
+
+目标得到：
+
+~~~text
+T_camera_lidar
+~~~
+
+并通过 ROS 2 TF 统一：
+
+~~~text
+camera frame ↔ MID360 frame ↔ base_link ↔ map
+~~~
+
+### 3. M1 验收
+
+~~~text
+[ ] RGB stream 稳定
+[ ] depth stream 稳定
+[ ] camera intrinsics 正确
+[ ] timestamps 能与 MID360 配合
+[ ] camera ↔ MID360 extrinsics 得到
+[ ] MID360 点能正确投影到 RGB
+[ ] aligned D435 depth 可用于后续 baseline
+~~~
+
+---
+
+## M2 — 开放词汇感知 + RGB-LiDAR 3D Grounding
+
+M2 分成两个明确问题：**先在 image space 找到目标，再把目标提升到 3D。**
+
+### M2.1 Open-Vocabulary Perception
+
+第一版直接冻结为：
+
+~~~text
+D435 RGB
+   ↓
+NanoOWL
+   ↓
+open-vocabulary bounding box
+   ↓
+NanoSAM
+   ↓
+object mask
+~~~
+
+References：
+
+- **OWL-ViT / TensorRT deployment：** [NVIDIA-AI-IOT/nanoowl](https://github.com/NVIDIA-AI-IOT/nanoowl)
+- **Jetson promptable segmentation：** [NVIDIA-AI-IOT/nanosam](https://github.com/NVIDIA-AI-IOT/nanosam)
+
+第一版 vocabulary 保持简单：
+
+~~~text
+chair
+door
+sofa
+printer
+table
+~~~
+
+第一版实现期间不继续随意换 detector。只有 Jetson 实测证明 accuracy、latency 或 deployment compatibility 不满足需求时才替换。
+
+### M2.2 主路线 — RGB + MID360
+
+~~~text
+object mask
+     │
+MID360 point cloud
+     ↓
+使用外参变换到 camera
+     ↓
+投影 LiDAR points → RGB image
+     ↓
+保留 object mask 内的点
+     ↓
+range / outlier filtering
+     ↓
+3D clustering
+     ↓
+robust object centroid / extent
+     ↓
+transform → map frame
+~~~
+
+语义从 2D lifting 到 3D 的整体思想参考 **ConceptFusion** 一类 open-set 2D→3D mapping 工作；但本项目主线不是依赖 camera depth，而是使用 MID360 作为主要 3D geometry。
+
+LiDAR projection / filtering 本身作为本项目 engineering module：基于已标定的 camera projection、ROS TF，以及标准 point-cloud filtering / clustering，不把它包装成新的独立 perception model。
+
+### M2.3 三组 Grounding Baseline
+
+#### A — RGB-D baseline
+
+~~~text
+RGB mask
+   +
+D435 aligned depth
+   ↓
+back-project object pixels
+   ↓
+3D object position
+~~~
+
+#### B — RGB + MID360 — 主方案
+
+~~~text
+RGB mask
+   +
+MID360 projection
+   ↓
+associated LiDAR points
+   ↓
+3D object position
+~~~
+
+#### C — RGB-D + MID360 — 可选融合
+
+~~~text
+D435 depth
+   +
+MID360 geometry
+   ↓
+cross-check / joint estimate
+   ↓
+3D object position
+~~~
+
+### M2 评估
+
+- 3D object-position error
+- grounding success rate
+- effective range / coverage
+- latency
+- Jetson CPU / GPU usage
+- occlusion、reflective surface、LiDAR sparse support、depth failure 等 failure cases
+
+---
+
+## M3 — Semantic Object Navigation
+
+M3 把语义目标变成可以执行的 metric goal。
+
+Reference：
+
+- [VLMaps — Visual Language Maps for Robot Navigation](https://github.com/vlmaps/vlmaps)：参考“把 semantic / language concept spatially grounded 到可导航位置”的架构思路。
+- [Navigation2](https://github.com/ros-navigation/navigation2)：真实机器人上的实际执行框架。
+
+**不会用 VLMaps 替换现有 Nav2。**
+
+~~~text
 semantic target
       ↓
-3D object position
+M2 map-frame object position
       ↓
-safe approach-pose generation
+candidate approach poses
+      ↓
+costmap / collision / reachability checks
+      ↓
+选择安全、朝向目标的 pose
       ↓
 Nav2 NavigateToPose
       ↓
-原有 MPPI / localization / chassis stack
-```
+real robot
+~~~
 
-第一阶段先把 ObjectNav / Semantic Navigation 做稳定，再进入真正长程语言导航。
+机器人不能直接导航到 object centroid，而要导航到物体周围一个安全的 approach pose。
 
-### M4 — Persistent Spatial Memory
+### M3 验收示例
 
-机器人需要记住已经离开当前视野的物体。
+~~~text
+"go to the chair"
+        ↓
+chair detected / grounded
+        ↓
+safe approach pose
+        ↓
+NavigateToPose
+        ↓
+robot reaches chair area
+~~~
 
-一个语义记忆节点可以包含：
+主要指标：
 
-```text
-object id
-semantic label
-visual embedding
+- semantic-goal success rate
+- navigation success rate
+- final distance to target
+- approach-pose validity
+- end-to-end latency
+- failure category
+
+---
+
+## M4 — Persistent Object-Level Spatial Memory
+
+M4 的核心是：**目标即使已经离开当前 camera FoV，机器人仍然知道它在哪里。**
+
+主要 reference：
+
+- [ConceptGraphs](https://github.com/concept-graphs/concept-graphs)
+
+第一版只借鉴它的 **object-centric persistent memory / scene representation** 思路，不要求完整复现整套 ConceptGraphs。
+
+一个 memory node 可以包含：
+
+~~~text
+object_id
+semantic_label
+visual_embedding
 map-frame position
+3D extent
 confidence
-observation count
-last-seen timestamp
+observation_count
+first_seen
+last_seen
 representative observation(s)
-```
+~~~
 
-这一阶段会把当前已有的 embedding / semantic work 与真实机器人感知重新连接起来。
+重复观测通过：
 
-### M5 — VLN
+~~~text
+spatial consistency
++
+semantic similarity
++
+visual similarity
+~~~
 
-计划采用**分层 VLN 架构**，而不是让 VLM 直接高频控制电机：
+进行 object association，然后更新 persistent record。
 
-```text
+示例：
+
+~~~text
+chair_01    → (2.1, 4.5)
+chair_02    → (5.2, 1.8)
+printer_01  → (7.4, 3.1)
+door_01     → (...)
+~~~
+
+随后：
+
+~~~text
+target 当前不可见
+        ↓
+query persistent memory
+        ↓
+retrieve stored map-frame object
+        ↓
+generate safe approach pose
+        ↓
+Nav2
+~~~
+
+---
+
+## M5 — VLN
+
+M5 明确放在 M4 之后：
+
+~~~text
 language instruction
         ↓
-VLM / language reasoning
+selected VLN / VLM reasoning method
         ↓
 persistent semantic-spatial memory
         ↓
-high-level semantic waypoint
+semantic waypoint(s)
         ↓
 Nav2 execution
-```
+~~~
 
-项目初始化阶段**不锁死具体 VLM / VLN 模型**。
+与早期“同时参考很多 VLN 方法”的做法不同，**进入 M5 前只选定一篇具体 VLN paper + 官方 / 主流 repo 作为主 reference，然后冻结实现范围**，不在开发过程中持续换方向。
 
-目前 HiCo-Nav 一类 hierarchical memory / reasoning 结构可以作为架构参考；ETPNav / 3DFF 保留为 route-VLN research baseline；NaVIDA 可以作为 direct-action comparison。这里描述的是后续候选方向，不表示它们已经集成到本仓库。
+## 实验设计
+
+核心 semantic-grounding 对比：
+
+~~~text
+A: D435 RGB + D435 depth
+B: D435 RGB + MID360          [主方案]
+C: D435 RGB + D435 depth + MID360
+~~~
+
+| Metric | A: RGB-D | B: RGB+MID360 | C: RGB-D+MID360 |
+|---|---:|---:|---:|
+| 3D localization error | measure | measure | measure |
+| grounding success rate | measure | measure | measure |
+| effective range | measure | measure | measure |
+| latency | measure | measure | measure |
+| Jetson resource usage | measure | measure | measure |
+
+Semantic navigation：
+
+| Metric | 定义 |
+|---|---|
+| success rate | robot 是否到达目标物体周围有效 approach region |
+| final target distance | robot / approach pose 到 semantic target 的距离 |
+| execution time | command → arrival |
+| failure type | perception / grounding / memory / planning / control |
 
 ## 设计原则
 
-1. **Real robot first。** 仿真用于降低风险和提高可复现性，但不能替代实机验证。
-2. **不重造底层平台。** FAST-LIO2、PGO、Nav2、MPPI 和 chassis control 继续作为外部依赖。
-3. **模块接口稳定优先。** detector、fusion、memory、VLM 都应该可以替换。
-4. **先测量，再优化。** 每个 milestone 都需要可重复的实机测试、日志和 failure cases。
-5. **路线锁死，模型不锁死。** detector、VLM 或 memory representation 可以变化，但项目目标不随论文变化。
-6. **Research 服务于工程问题。** 新 VLN / spatial intelligence 方法只有在解决真实 failure 或带来可测能力时才进入主线。
-7. **Depth 是选项，不是拐杖。** RGB-D depth 可以加速 baseline 和调试，但 RGB + MID360 必须能够独立完成主要 semantic grounding。
+1. **Real robot first。** 仿真不能替代真实机器人验证。
+2. **不重造底层平台。** FAST-LIO2、PGO、Nav2、MPPI、chassis control 都保持为外部依赖。
+3. **每个关键设计都有 reference。** 每个 milestone 都从明确 paper、repo 或现有平台实现出发。
+4. **先冻结第一版，再根据数据改。** 没有量化 failure，不随意换模型。
+5. **MID360 是主要 geometry source。** D435 depth 很有用，但主 semantic pipeline 不能依赖它。
+6. **对比必须可解释。** RGB-D、RGB+LiDAR、RGB-D+LiDAR 是三条明确分开的 grounding variant。
+7. **Hierarchical autonomy。** 高层 semantic / language module 负责决定去哪；Nav2 继续负责安全运动执行。
+8. **记录 failure，而不只记录 success。** 每个 milestone 都保留可复现实验、日志和 failure category。
 
 ## 初期明确不做
 
-- 重写 FAST-LIO2 或研究新 SLAM 算法
-- 重建 Nav2 或底盘控制栈
+- 重写 FAST-LIO2
+- M0 阶段替换现有 PGO backend
+- 重建 Nav2 / MPPI
+- 把 D435 depth 设为主 semantic pipeline 的强制依赖
 - 从头训练大型 VLM
-- 在没有明确需求前把 3D Gaussian Splatting 设成项目必选项
-- 把 RGB-D camera depth 设成 semantic navigation 的强制依赖
-- 在 M3 尚未稳定前把完整 VLN research 作为主开发任务
-- 在没有实机验证前声称系统已经实现 end-to-end autonomy
+- M3 / M4 稳定前进入 long-horizon VLN
+- 提前创建大量不会立刻使用的 ROS package
+- 在没有复现和实机验证前声称某篇 paper 已经集成
 
 ## 计划中的仓库结构
 
-仓库只随着实际 milestone 增长，不提前创建大量空 package。
+只在对应 milestone 真正开始实现时创建 package。
 
-```text
+~~~text
 real-world-rgb-lidar-navigation/
 ├── README.md
 ├── README.zh-CN.md
@@ -266,24 +560,39 @@ real-world-rgb-lidar-navigation/
 │   ├── architecture.md
 │   ├── platform_interface.md
 │   ├── calibration.md
+│   ├── references.md
 │   └── benchmark_protocol.md
 ├── src/
 │   ├── camera_bringup/          # M1
-│   ├── rgb_lidar_fusion/        # M2
+│   ├── rgb_lidar_grounding/     # M2
 │   ├── object_localization/     # M2
 │   ├── semantic_goal_server/    # M3
-│   └── semantic_map/            # M4
+│   └── semantic_memory/         # M4
 ├── launch/
 ├── config/
 ├── tests/
 └── benchmarks/
-```
+~~~
+
+## Reference 总表
+
+| Module | 第一版 reference |
+|---|---|
+| MID360 ROS | [Livox ROS Driver 2](https://github.com/Livox-SDK/livox_ros_driver2) |
+| LiDAR-Inertial Odometry | [FAST_LIO](https://github.com/hku-mars/FAST_LIO) |
+| metric navigation | [Navigation2](https://github.com/ros-navigation/navigation2) + 现有 robot platform |
+| D435 ROS | [realsense-ros](https://github.com/realsenseai/realsense-ros) |
+| Camera-LiDAR calibration | [FAST-Calib](https://github.com/hku-mars/FAST-Calib) |
+| open-vocabulary detection | [NanoOWL](https://github.com/NVIDIA-AI-IOT/nanoowl) |
+| object mask | [NanoSAM](https://github.com/NVIDIA-AI-IOT/nanosam) |
+| 2D→3D semantic lifting concept | ConceptFusion |
+| semantic navigation | [VLMaps](https://github.com/vlmaps/vlmaps) + Nav2 |
+| persistent object memory | [ConceptGraphs](https://github.com/concept-graphs/concept-graphs) |
+| VLN | M5 前冻结一个具体 reference |
 
 ## 最终成功标准
 
-整个项目希望沿着以下能力逐步推进：
-
-```text
+~~~text
 RViz metric goal
       ↓
 visible semantic object goal
@@ -291,10 +600,10 @@ visible semantic object goal
 remembered object goal
       ↓
 multi-step language instruction
-```
+~~~
 
 最终成果不是某一个模型，而是一套能够把：
 
-**真实传感器 → 语义感知 → 空间记忆 → 语言推理 → 安全机器人导航**
+**真实传感器 → 语义感知 → 3D grounding → 空间记忆 → 语言推理 → 安全机器人导航**
 
-真正连接起来的可复现 Robotics Software 系统。
+真正连接起来的可复现实机 Robotics Software 系统。
