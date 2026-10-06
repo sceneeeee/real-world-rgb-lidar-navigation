@@ -1,6 +1,6 @@
 # Real-World RGB-D + LiDAR Object Navigation
 
-[English](README.md) | [Simplified Chinese](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 **A hardware-adapted reproduction of modular Object Goal Navigation, based on Gervet et al., _Navigating to Objects in the Real World_ (Science Robotics, 2023), and its SemExp algorithm lineage.**
 
